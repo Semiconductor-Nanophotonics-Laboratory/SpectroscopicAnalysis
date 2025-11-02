@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -172,24 +173,60 @@ def export_text_spectra(path: str, x: np.ndarray, y: np.ndarray, coord_xy: np.nd
         for xi, yi in zip(x, y.squeeze()):
             f.write(f"{xi:.9f}\t{yi:.9f}\n")
 
-
 def save_origin_ready_csv(outdir: str, stem: str, x: np.ndarray,
                           y: np.ndarray, peaks: np.ndarray, baseline: float) -> str:
     """
     Origin에서 바로 쓸 수 있게 멀티컬럼 CSV 생성:
-    col0=x, col1=data, col2=recon(sum), col3=baseline, col4~: peak_j
+    col0=x, col1=data, col2=recon(sum of peaks), col3=baseline, col4~: peak_j
+    입력 peaks는 (P,L) 또는 (1,P,L) 등 다양한 형태를 허용하며 내부에서 (P,L)로 정규화.
     """
     out_path = f"{outdir}/{stem}_origin.csv"
-    x = x.reshape(-1)
-    data = y.reshape(-1)
-    recon = peaks.sum(axis=1).reshape(-1)  # (L,)
-    base = np.full_like(x, float(baseline))
+
+    # --- 기본 축/데이터 ---
+    x = np.asarray(x).reshape(-1)
+    data = np.asarray(y).reshape(-1)
+
+    # --- peaks 정규화: (P,L)로 맞춤 ---
+    pk = np.asarray(peaks)
+    if pk.ndim == 3:
+        # (B,P,L) → 첫 배치 사용
+        if pk.shape[0] != 1:
+            # 배치가 여러 개여도 첫 배치만 사용 (필요 시 확장 가능)
+            pk = pk[0]
+        else:
+            pk = pk[0]  # (P,L)
+    if pk.ndim == 1:
+        # (L,) 단일 성분 → (1,L)
+        pk = pk.reshape(1, -1)
+
+    # (P,L) 또는 (L,P)일 수 있으니 x 길이와 맞춰 축 전환
+    if pk.shape[1] == x.size:
+        # 이미 (P,L)
+        pass
+    elif pk.shape[0] == x.size:
+        # (L,P) → (P,L)로 전치
+        pk = pk.T
+    else:
+        raise ValueError(
+            f"peaks has incompatible shape {pk.shape} with x length {x.size}. "
+            "Expected second (or first) dim to match len(x)."
+        )
+
+    P, L = pk.shape
+    if L != x.size:
+        raise ValueError(f"After normalization, peaks.shape={pk.shape} but len(x)={x.size}")
+
+    # --- 합성(recon)과 baseline 컬럼 생성 ---
+    recon = pk.sum(axis=0)  # (L,)
+    base = np.full_like(x, float(baseline), dtype=float)
+
+    # --- 열 결합 ---
     cols = [x, data, recon, base]
-    for j in range(peaks.shape[0]):  # peaks: (P,L) 입맛에 맞게 변환
-        cols.append(peaks[j, :])
+    for j in range(P):
+        cols.append(pk[j, :])
 
     mat = np.column_stack(cols)
-    header = ["x", "data", "recon", "baseline"] + [f"peak_{j+1}" for j in range(peaks.shape[0])]
+    header = ["x", "data", "recon", "baseline"] + [f"peak_{j+1}" for j in range(P)]
     np.savetxt(out_path, mat, delimiter=",", header=",".join(header), comments="", fmt="%.9g")
     return out_path
 
@@ -362,7 +399,7 @@ class SpectrumFitter:
         )
         opt = optim.Adam([self.pos, self.width, self.height, self.eta, self.base], lr=lr)
         self.loss_history.clear()
-        for it in range(1, iters + 1):
+        for _ in range(1, iters + 1):
             opt.zero_grad()
             recon, _ = self.forward(active=active)
             loss = self._loss(recon)
@@ -388,11 +425,6 @@ class SpectrumFitter:
             # legacy 2-stage
             self.fit_stage(cfg.h.num_iter_stage1, cfg.h.lr_stage1, "Stage 1", cfg.stage1)
             self.fit_stage(cfg.h.num_iter_stage2, cfg.h.lr_stage2, "Stage 2", cfg.stage2)
-
-    @property
-    def h(self) -> FitHyperParams:
-        # (호출부가 필요 시 참조) – 현재는 위 fit()에서 cfg.h를 직접 사용
-        return FitHyperParams()
 
     def params(self):
         to_np = lambda t: t.detach().cpu().numpy()
@@ -615,3 +647,59 @@ def load_FitSpectrumMapNpz(path: str) -> FitSpectrumMap:
         peak_types=peak_types, pos=pos, width=width, height=height, eta=eta, base=base,
         recon=recon, peaks_3d=peaks_3d, valid_mask=valid_mask, metadata=metadata
     )
+
+
+# =============================================================================
+# NEW: DEMO_PEAKS block exporter (for copy-paste)
+# =============================================================================
+
+def _fmt_float(val: float, places: int = 1) -> str:
+    return f"{val:.{places}f}"
+
+def format_demo_peaks_block_text(params, cfg_peaks: List[PeakSpec], sort_by_pos: bool) -> str:
+    """
+    최종 피팅 파라미터 -> DEMO_PEAKS 블록 문자열 생성.
+    - type : display_types ('gaussian'|'lorentzian'|'pseudovoigt')
+    - pos/width/height : 최종값
+    - limit 계열은 cfg_peaks에서 유지
+    - pV일 때 extra={"eta":...}
+    """
+    # cfg_peaks 정렬 규칙을 피팅 순서와 일치
+    peaks_sorted = sorted(cfg_peaks, key=lambda p: p.pos) if sort_by_pos else list(cfg_peaks)
+
+    disp_types = list(params["display_types"])
+    pos    = params["pos"][0, :, 0]
+    width  = params["width"][0, :, 0]
+    height = params["height"][0, :, 0]
+    eta    = params["eta"][0, :, 0]
+
+    lines = []
+    lines.append("DEMO_PEAKS: List[PeakSpec] = [")
+    for j, (ptype, pj, wj, hj, ej) in enumerate(zip(disp_types, pos, width, height, eta)):
+        lim = peaks_sorted[j]
+        tstr = ("pseudovoigt" if ptype.lower().startswith("pseudo")
+                else "lorentzian" if "lorentz" in ptype.lower()
+                else "gaussian")
+        base = (f'    PeakSpec(type="{tstr}", '
+                f'pos={_fmt_float(float(pj), 1)}, '
+                f'width={_fmt_float(float(wj), 1)}, '
+                f'height={float(hj):g}, '
+                f'pos_limit={float(lim.pos_limit):g},  pos_limit_reg={float(lim.pos_limit_reg):g}, '
+                f'width_limit={float(lim.width_limit):g}, width_limit_reg={float(lim.width_limit_reg):g}, '
+                f'height_limit={float(lim.height_limit):g}, height_limit_reg={float(lim.height_limit_reg):g}')
+        if tstr == "pseudovoigt":
+            base += f', extra={{"eta":{float(ej):.3f}}}'
+        base += "),"
+        lines.append(base)
+    lines.append("]")
+    return "\n".join(lines)
+
+def save_demo_peaks_block(outdir: Path, stem: str, idx: int, params, cfg_peaks: List[PeakSpec], sort_by_pos: bool) -> Path:
+    """
+    DEMO_PEAKS 블록을 파일로 저장.
+    파일명: DEMO_PEAKS_{stem}_idx{idx}.txt
+    """
+    text = format_demo_peaks_block_text(params, cfg_peaks, sort_by_pos)
+    path = outdir / f"DEMO_PEAKS_{stem}_idx{idx}.txt"
+    path.write_text(text, encoding="utf-8")
+    return path

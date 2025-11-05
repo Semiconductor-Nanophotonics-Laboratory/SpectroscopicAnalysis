@@ -1,4 +1,3 @@
-# fit_module_StandardSpectrumMapNpz.py
 from __future__ import annotations
 
 import logging
@@ -189,22 +188,16 @@ def save_origin_ready_csv(outdir: str, stem: str, x: np.ndarray,
     # --- peaks 정규화: (P,L)로 맞춤 ---
     pk = np.asarray(peaks)
     if pk.ndim == 3:
-        # (B,P,L) → 첫 배치 사용
         if pk.shape[0] != 1:
-            # 배치가 여러 개여도 첫 배치만 사용 (필요 시 확장 가능)
             pk = pk[0]
         else:
             pk = pk[0]  # (P,L)
     if pk.ndim == 1:
-        # (L,) 단일 성분 → (1,L)
         pk = pk.reshape(1, -1)
 
-    # (P,L) 또는 (L,P)일 수 있으니 x 길이와 맞춰 축 전환
     if pk.shape[1] == x.size:
-        # 이미 (P,L)
         pass
     elif pk.shape[0] == x.size:
-        # (L,P) → (P,L)로 전치
         pk = pk.T
     else:
         raise ValueError(
@@ -216,11 +209,9 @@ def save_origin_ready_csv(outdir: str, stem: str, x: np.ndarray,
     if L != x.size:
         raise ValueError(f"After normalization, peaks.shape={pk.shape} but len(x)={x.size}")
 
-    # --- 합성(recon)과 baseline 컬럼 생성 ---
     recon = pk.sum(axis=0)  # (L,)
     base = np.full_like(x, float(baseline), dtype=float)
 
-    # --- 열 결합 ---
     cols = [x, data, recon, base]
     for j in range(P):
         cols.append(pk[j, :])
@@ -233,6 +224,7 @@ def save_origin_ready_csv(outdir: str, stem: str, x: np.ndarray,
 
 # =============================================================================
 # pV unified synthesis (Gaussian, Lorentzian normalized kernels)
+# width는 FWHM 체계로 들어온다고 가정 (G: sigma=FWHM/2.3548, L: gamma=FWHM/2)
 # =============================================================================
 
 def _gaussian_norm(x: torch.Tensor, mu: torch.Tensor, fwhm: torch.Tensor) -> torch.Tensor:
@@ -251,7 +243,7 @@ def synthesize_pv(x: torch.Tensor, pos: torch.Tensor, width: torch.Tensor, heigh
     """
     x        : (B,L)
     pos      : (B,P,1)
-    width    : (B,P,1)
+    width    : (B,P,1)   # FWHM
     height   : (B,P,1)
     base     : (B,L)
     eta      : (B,P,1)   (0: pure Gaussian, 1: pure Lorentzian)
@@ -295,7 +287,7 @@ def build_torch_args(cfg: FitConfig, x_np: np.ndarray):
     P = len(peaks)
 
     pos0    = torch.tensor([[p.pos for p in peaks]], dtype=torch.float32).unsqueeze(-1)    # (1,P,1)
-    width0  = torch.tensor([[p.width for p in peaks]], dtype=torch.float32).unsqueeze(-1)  # (1,P,1)
+    width0  = torch.tensor([[p.width for p in peaks]], dtype=torch.float32).unsqueeze(-1)  # (1,P,1)  # FWHM
     height0 = torch.tensor([[p.height for p in peaks]], dtype=torch.float32).unsqueeze(-1) # (1,P,1)
 
     eta_init = []
@@ -341,7 +333,7 @@ class SpectrumFitter:
 
         # trainable
         self.pos    = nn.Parameter(targs["pos0"].to(self.device))     # (1,P,1)
-        self.width  = nn.Parameter(targs["width0"].to(self.device))   # (1,P,1)
+        self.width  = nn.Parameter(targs["width0"].to(self.device))   # (1,P,1)  # FWHM
         self.height = nn.Parameter(targs["height0"].to(self.device))  # (1,P,1)
         self.eta    = nn.Parameter(targs["eta0"].to(self.device))     # (1,P,1)
         self.base   = nn.Parameter(targs["base0"].to(self.device))    # (1,1)
@@ -363,14 +355,39 @@ class SpectrumFitter:
 
         self.loss_history: List[float] = []
 
+    # --- NEW: eta 규칙 강제 (표/합성/저장 모두 동일하게 쓰기) ---
+    def _eta_effective(self) -> torch.Tensor:
+        """
+        lorentzian -> 1.0, gaussian -> 0.0, pseudovoigt만 학습치 사용.
+        """
+        et = torch.clamp(self.eta, 0.0, 1.0).clone()
+        for j, t in enumerate(self.display_types):
+            tl = t.lower()
+            if "lorentz" in tl:
+                et[:, j, :].fill_(1.0)
+            elif "gauss" in tl:
+                et[:, j, :].fill_(0.0)
+        return et
+
+    def _enforce_eta_constraints_(self) -> None:
+        with torch.no_grad():
+            self.eta.clamp_(0.0, 1.0)
+            for j, t in enumerate(self.display_types):
+                tl = t.lower()
+                if "lorentz" in tl:
+                    self.eta[:, j, :].fill_(1.0)
+                elif "gauss" in tl:
+                    self.eta[:, j, :].fill_(0.0)
+
     def forward(self, active: Union[str, List[int]] = "all"):
         if isinstance(active, str) and active == "all":
             active_idx = list(range(self.num_peaks))
         else:
             active_idx = list(active) if isinstance(active, (list, tuple)) else []
+        eta_eff = self._eta_effective()
         recon, peaks = synthesize_pv(
             self.x, self.pos, self.width, self.height,
-            self.base.expand_as(self.x), self.eta, active=active_idx
+            self.base.expand_as(self.x), eta_eff, active=active_idx
         )
         return recon, peaks
 
@@ -407,9 +424,10 @@ class SpectrumFitter:
             opt.step()
 
             with torch.no_grad():
-                self.eta.clamp_(0.0, 1.0)
                 self.width.clamp_(min=1e-4)
                 self.height.clamp_(min=-1e3)
+            # η 고정 규칙 재적용 (옵티마이저 업데이트 이후)
+            self._enforce_eta_constraints_()
 
             self.loss_history.append(float(loss.detach().cpu().item()))
         logging.info("fit_module_StandardSpectrumMapNpz: %s done.", stage_name)
@@ -430,9 +448,9 @@ class SpectrumFitter:
         to_np = lambda t: t.detach().cpu().numpy()
         return {
             "pos": to_np(self.pos),           # (1,P,1)
-            "width": to_np(self.width),       # (1,P,1)
+            "width": to_np(self.width),       # (1,P,1)  # FWHM
             "height": to_np(self.height),     # (1,P,1)
-            "eta": to_np(self.eta),           # (1,P,1)
+            "eta": to_np(self.eta),           # (1,P,1)  # raw (표시는 effective 사용)
             "base": to_np(self.base),         # (1,1)
             "display_types": np.array(self.display_types, dtype=object)
         }
@@ -460,12 +478,24 @@ def _scalar(v):
     except Exception:
         return float(np.asarray(v).reshape(-1)[0])
 
+def compute_peak_areas(fitter: SpectrumFitter) -> np.ndarray:
+    """
+    각 피크의 '정확한' 면적을 x축에서 수치적분(trapezoidal rule)으로 계산.
+    반환: (B,P)  (보통 B=1)
+    """
+    with torch.no_grad():
+        x = fitter.x.detach().cpu().numpy().squeeze()        # (L,)
+        _, peaks = fitter.forward(active="all")               # (1,P,L)
+        peaks = peaks.detach().cpu().numpy().squeeze(0)       # (P,L)
+    areas = np.trapz(peaks, x, axis=-1)                       # (P,)
+    return areas.reshape(1, -1)
+
 
 def fig_initial_guess(fitter: SpectrumFitter, cfg: FitConfig) -> plt.Figure:
     x = fitter.x.detach().cpu().numpy().squeeze()
     y = fitter.y.detach().cpu().numpy().squeeze()
     with torch.no_grad():
-        recon, peaks = fitter.forward(active="all")
+        recon, peaks = fitter.forward(active="all")  # eta_effective + baseline 포함
     recon = recon.detach().cpu().numpy().squeeze()
     peaks = peaks.detach().cpu().numpy().squeeze()  # (P,L)
 
@@ -483,13 +513,6 @@ def fig_initial_guess(fitter: SpectrumFitter, cfg: FitConfig) -> plt.Figure:
     fig.tight_layout()
     return fig
 
-
-def compute_peak_areas(params, display_types: List[str]) -> np.ndarray:
-    # pV 커널이 적분 1이므로 면적 ≈ height
-    h = params["height"]  # (B,P,1)
-    return h[..., 0]      # (B,P)
-
-
 def fig_final_fit(fitter: SpectrumFitter, cfg: FitConfig) -> plt.Figure:
     x = fitter.x.detach().cpu().numpy().squeeze()
     y = fitter.y.detach().cpu().numpy()
@@ -500,9 +523,12 @@ def fig_final_fit(fitter: SpectrumFitter, cfg: FitConfig) -> plt.Figure:
     pos    = np.array([_scalar(v) for v in params["pos"][0, :, 0]])
     width  = np.array([_scalar(v) for v in params["width"][0, :, 0]])
     height = np.array([_scalar(v) for v in params["height"][0, :, 0]])
-    eta    = np.array([_scalar(v) for v in params["eta"][0, :, 0]])
 
-    areas = compute_peak_areas(params, list(params["display_types"]))
+    # --- η는 effective로 표시 ---
+    with torch.no_grad():
+        eta_eff = fitter._eta_effective().detach().cpu().numpy()[0, :, 0]
+
+    areas = compute_peak_areas(fitter)           # (1,P)
     areas_row = areas[0, :]
 
     fig, ax = plt.subplots(3, 1, figsize=(12, 11), gridspec_kw={"height_ratios": [1, 1, 0.7]})
@@ -514,7 +540,7 @@ def fig_final_fit(fitter: SpectrumFitter, cfg: FitConfig) -> plt.Figure:
 
     ax[1].plot(x, y[idx], alpha=0.3)
     for j in range(fitter.num_peaks):
-        ax[1].plot(x, peaks[idx, j, :], label=f"peak {j+1} ({fitter.display_types[j]}, η={eta[j]:.3f})")
+        ax[1].plot(x, peaks[idx, j, :], label=f"peak {j+1} ({fitter.display_types[j]}, η={eta_eff[j]:.3f})")
         ax[1].axvline(pos[j], ls=":", alpha=0.4)
     ax[1].set_xlabel(cfg.x_label); ax[1].set_ylabel(cfg.y_label)
     ax[1].legend(ncol=2, fontsize=8); ax[1].grid(True, ls=":", alpha=0.5)
@@ -525,12 +551,12 @@ def fig_final_fit(fitter: SpectrumFitter, cfg: FitConfig) -> plt.Figure:
               f"{pos[j]:.3f}",
               f"{width[j]:.3f}",
               f"{height[j]:.4f}",
-              f"{eta[j]:.4f}",
+              f"{eta_eff[j]:.4f}",
               f"{areas_row[j]:.6g}"]
              for j in range(fitter.num_peaks)]
     tbl = ax[2].table(
         cellText=table,
-        colLabels=["#", "type", "pos", "width(FWHM)", "height", "eta", "area≈height"],
+        colLabels=["#", "type", "pos", "width(FWHM)", "height", "eta", "area"],
         loc="center"
     )
     tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1, 1.15)
@@ -570,6 +596,7 @@ class FitSpectrumMap:
         pos = torch.from_numpy(self.pos[idx:idx+1, :, None]).float()
         width = torch.from_numpy(self.width[idx:idx+1, :, None]).float()
         height = torch.from_numpy(self.height[idx:idx+1, :, None]).float()
+        # --- eta는 저장된 타입 규칙 반영 필요: 외부 재합성에서는 raw를 그대로 쓰되, caller가 보정 ---
         eta = torch.from_numpy(self.eta[idx:idx+1, :, None]).float()
         base = torch.from_numpy(self.base[idx:idx+1, None]).float()
         with torch.no_grad():
@@ -650,32 +677,37 @@ def load_FitSpectrumMapNpz(path: str) -> FitSpectrumMap:
 
 
 # =============================================================================
-# NEW: DEMO_PEAKS block exporter (for copy-paste)
+# DEMO_PEAKS block exporter (for copy-paste)
 # =============================================================================
 
 def _fmt_float(val: float, places: int = 1) -> str:
     return f"{val:.{places}f}"
 
-def format_demo_peaks_block_text(params, cfg_peaks: List[PeakSpec], sort_by_pos: bool) -> str:
+def format_demo_peaks_block_text(params, cfg_peaks: List[PeakSpec], sort_by_pos: bool,
+                                 eta_override: Optional[np.ndarray] = None) -> str:
     """
     최종 피팅 파라미터 -> DEMO_PEAKS 블록 문자열 생성.
     - type : display_types ('gaussian'|'lorentzian'|'pseudovoigt')
-    - pos/width/height : 최종값
+    - pos/width/height : 최종값(FWHM 체계)
     - limit 계열은 cfg_peaks에서 유지
     - pV일 때 extra={"eta":...}
+    - eta_override가 주어지면 그 값을 사용(효과적 η를 외부에서 전달)
     """
-    # cfg_peaks 정렬 규칙을 피팅 순서와 일치
     peaks_sorted = sorted(cfg_peaks, key=lambda p: p.pos) if sort_by_pos else list(cfg_peaks)
 
     disp_types = list(params["display_types"])
     pos    = params["pos"][0, :, 0]
     width  = params["width"][0, :, 0]
     height = params["height"][0, :, 0]
-    eta    = params["eta"][0, :, 0]
+    eta_raw = params["eta"][0, :, 0]
+    if eta_override is not None:
+        eta_arr = eta_override.reshape(-1)
+    else:
+        eta_arr = eta_raw
 
     lines = []
     lines.append("DEMO_PEAKS: List[PeakSpec] = [")
-    for j, (ptype, pj, wj, hj, ej) in enumerate(zip(disp_types, pos, width, height, eta)):
+    for j, (ptype, pj, wj, hj, ej) in enumerate(zip(disp_types, pos, width, height, eta_arr)):
         lim = peaks_sorted[j]
         tstr = ("pseudovoigt" if ptype.lower().startswith("pseudo")
                 else "lorentzian" if "lorentz" in ptype.lower()
@@ -694,12 +726,13 @@ def format_demo_peaks_block_text(params, cfg_peaks: List[PeakSpec], sort_by_pos:
     lines.append("]")
     return "\n".join(lines)
 
-def save_demo_peaks_block(outdir: Path, stem: str, idx: int, params, cfg_peaks: List[PeakSpec], sort_by_pos: bool) -> Path:
+def save_demo_peaks_block(outdir: Path, stem: str, idx: int, params, cfg_peaks: List[PeakSpec], sort_by_pos: bool,
+                          eta_override: Optional[np.ndarray] = None) -> Path:
     """
     DEMO_PEAKS 블록을 파일로 저장.
     파일명: DEMO_PEAKS_{stem}_idx{idx}.txt
     """
-    text = format_demo_peaks_block_text(params, cfg_peaks, sort_by_pos)
+    text = format_demo_peaks_block_text(params, cfg_peaks, sort_by_pos, eta_override=eta_override)
     path = outdir / f"DEMO_PEAKS_{stem}_idx{idx}.txt"
     path.write_text(text, encoding="utf-8")
     return path
